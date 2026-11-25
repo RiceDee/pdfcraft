@@ -254,7 +254,7 @@ mod tests {
             progress: optimize_progress.clone(),
             stage: Arc::new(Mutex::new(OptimizeStage::Discarding)),
         });
-        h.state_mut().scan_clean_run = Some(ScanCleanRun { doc: DocId(1), progress: scan_progress.clone() });
+        h.state_mut().scan_clean_run = Some(ScanCleanRun { doc: DocId(1), ask: Default::default(), progress: scan_progress.clone() });
         h.get_by_label("Cancel").click();
         h.run_steps(3);
         assert!(optimize_progress.cancelled(), "Cancel reaches the Optimize job");

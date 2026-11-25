@@ -1,19 +1,22 @@
 //! Scan & OCR ▸ Enhance scanned file: the dialog (pages, background removal level, edge
 //! shadows, despeckle, halftone restore) and the background run with its progress card. The scans are cleaned
 //! on the host's job queue ([`pdfcraft_engine::scan_clean`]); the result is applied as one undoable
-//! step when it is done, unless the document changed meanwhile.
+//! step when it is done, unless the document changed meanwhile. A run that restored halftone scans
+//! opens a result window ([`super::scan_clean_result`]), whose sliders run it again.
 
 use std::sync::Arc;
 
 use craft::pages::PageRange;
 use craft::pages::ui::{PageRangeChoices, PageRangeOptions};
+use craft::ui::contract::Bind;
 use craft::ui::dialog::{DialogResult, dialog_id};
 use craft::ui::patterns::form_dialogs::{DialogFields, HostedParamDialog, Param, ParamDialog, ParamKind};
 use craft::ui::value_drag::SliderScale;
-use pdfcraft_engine::scan_clean::{ScanCleanReport, ScanCleanSettings, ScanCleaned};
+use pdfcraft_engine::scan_clean::{ScanCleanJob, ScanCleanReport, ScanCleanSettings, ScanCleaned};
 use pdfcraft_engine::{DocId, EditError};
 
 use super::job_count::JobCount;
+use super::scan_clean_result::{self, ScanResultDialog};
 use crate::PdfCraftApp;
 use crate::notices::ProgressNotice;
 use crate::notices::{self, ProgressKey};
@@ -31,7 +34,18 @@ pub struct ScanCleanDraft {
 /// A running clean-up: its document and the count the job and the progress card share.
 pub struct ScanCleanRun {
     pub doc: DocId,
+    pub ask: ScanCleanAsk,
     pub progress: Arc<JobCount>,
+}
+
+/// What a clean-up was asked to do.
+#[derive(Default)]
+pub struct ScanCleanAsk {
+    /// The pages (0-based).
+    pub pages: Vec<usize>,
+    pub settings: ScanCleanSettings,
+    /// The pages (0-based) to restore again, when the run repeats the one the result window shows.
+    pub again: Option<Vec<usize>>,
 }
 
 /// The settings the dialog's fields hold; a field that is absent keeps `base`'s value.
@@ -71,7 +85,7 @@ fn build_dialog(fields: &mut DialogFields, base: ScanCleanSettings, count: usize
         )),
     ];
     let ready = settings_from(fields, base).changes_something();
-    ParamDialog::new(DIALOG_KEY, tl!("Enhance Scanned File"), params).ok_label(tl!("Enhance").into()).ok_enabled(ready)
+    ParamDialog::new(DIALOG_KEY, tl!("Enhance Scanned File"), params).ok_label(tl!("Enhance").into()).ok_enabled(ready).values(Bind::bound(fields))
 }
 
 /// What a finished run says: what was cleaned, what was not a scan, and what was left and why.
@@ -141,17 +155,7 @@ impl PdfCraftApp {
     /// Clean up the scans on the pages chosen in the dialog, in the background.
     pub fn start_scan_clean(&mut self, ctx: &egui::Context) {
         let Some((vi, id)) = self.active_ids() else { return };
-        if self.scan_clean_run.is_some() {
-            self.notify_tr("Scanned pages are already being enhanced");
-            return;
-        }
-        // Both jobs share the progress card and capture the same document state.
-        if self.optimize_run.is_some() {
-            self.notify_tr("Optimization is already running");
-            return;
-        }
-        // What's typed in a form field is part of the document (#166).
-        if !self.commit_form_typing(ctx) {
+        if !self.may_start_scan_clean(ctx) {
             return;
         }
         let count = self.session.get(id).map_or(0, |d| d.info.pages.len());
@@ -167,6 +171,64 @@ impl PdfCraftApp {
             Ok(job) => job,
             Err(e) => return self.notify(e.to_string()),
         };
+        let ask = ScanCleanAsk { pages, settings: d.settings, again: None };
+        self.submit_scan_clean(id, job, ask);
+    }
+
+    /// Enhance again the pages of the run the result window shows, with the sliders' tunings. The enhancement stays in the
+    /// document until the new one takes its place, as the same one step, so a run that is cancelled or fails changes
+    /// nothing. Only the pages a slider moved are restored again; every other picture of the run is kept as it is, so a
+    /// nudge costs one page's restore, not the document's.
+    pub(super) fn retune_scan_clean(&mut self, ctx: &egui::Context) {
+        let Some(o) = self.dialogs.get::<ScanResultDialog>() else { return };
+        let (doc, generation) = (o.doc, o.generation);
+        // The typing in a form field goes in first; when that changes the document, the window closes saying so.
+        if self.active_ids().map(|(_, id)| id) != Some(doc)
+            || !self.may_start_scan_clean(ctx)
+            || self.session.get(doc).map(|d| d.edit_generation()) != Some(generation)
+        {
+            return;
+        }
+        let Some(o) = self.dialogs.get_mut::<ScanResultDialog>() else { return };
+        let (pages, settings, tunings) = (o.requested.clone(), o.settings, o.tunings.clone());
+        let again = std::mem::take(&mut o.again);
+        let job = self.session.scan_clean_kept(doc, o.halftone.clone()).and_then(|kept| {
+            let job = self.session.scan_clean_again_job(doc, &pages, settings)?;
+            Ok(job.with_page_tunings(tunings).keeping(kept, &again))
+        });
+        match job {
+            Ok(job) => self.submit_scan_clean(doc, job, ScanCleanAsk { pages, settings, again: Some(again) }),
+            Err(e) => {
+                self.notify(e.to_string());
+                scan_clean_result::not_done(self, doc, again);
+            }
+        }
+    }
+
+    /// Whether a run may start now: no other is going, and what's typed in a form field is in the document.
+    fn may_start_scan_clean(&mut self, ctx: &egui::Context) -> bool {
+        if self.scan_clean_run.is_some() {
+            self.notify_tr("Scanned pages are already being enhanced");
+            return false;
+        }
+        // Both jobs share the progress card and capture the same document state.
+        if self.optimize_run.is_some() {
+            self.notify_tr("Optimization is already running");
+            return false;
+        }
+        // What's typed in a form field is part of the document (#166).
+        self.commit_form_typing(ctx)
+    }
+
+    /// The page rasters, tiles and thumbnails show the old pixels at the same scale.
+    fn invalidate_scan_pages(&mut self, doc: DocId) {
+        for v in self.views.iter_mut().filter(|v| v.id == doc) {
+            v.invalidate_content();
+        }
+    }
+
+    /// Runs `job` on the host's queue.
+    fn submit_scan_clean(&mut self, id: DocId, job: ScanCleanJob, ask: ScanCleanAsk) {
         let progress = Arc::new(JobCount::default());
         progress.set(0, job.total());
         let (count, wake) = (progress.clone(), self.wake.clone());
@@ -180,7 +242,7 @@ impl PdfCraftApp {
             })
             .unwrap_or_else(|message| Err(EditError::Invalid(message)))
         });
-        self.scan_clean_run = Some(ScanCleanRun { doc: id, progress });
+        self.scan_clean_run = Some(ScanCleanRun { doc: id, ask, progress });
         self.post_scan_clean_progress();
     }
 
@@ -219,23 +281,36 @@ impl PdfCraftApp {
             return;
         };
         notices::end_progress(self, ProgressKey::ScanClean);
-        self.scan_clean_run = None;
-        self.land_scan_clean(finished.key, finished.result);
+        if let Some(run) = self.scan_clean_run.take() {
+            self.land_scan_clean(run, finished.result);
+        }
     }
 
-    /// Applies a finished clean-up to `doc` as one undoable step and says what it did.
-    pub(crate) fn land_scan_clean(&mut self, doc: DocId, result: Result<ScanCleaned, EditError>) {
-        match result.and_then(|cleaned| self.session.apply_scan_clean(doc, cleaned)) {
+    /// Applies a finished clean-up as one undoable step, says what it did, and shows the result window when it
+    /// restored halftone scans.
+    pub(crate) fn land_scan_clean(&mut self, run: ScanCleanRun, result: Result<ScanCleaned, EditError>) {
+        let doc = run.doc;
+        let again = run.ask.again.is_some();
+        let applied = result.and_then(|cleaned| match again {
+            true => self.session.replace_scan_clean(doc, cleaned),
+            false => self.session.apply_scan_clean(doc, cleaned),
+        });
+        match applied {
             Ok(report) => {
-                // The page rasters, tiles and thumbnails show the old pixels at the same scale.
-                for v in self.views.iter_mut().filter(|v| v.id == doc) {
-                    v.invalidate_content();
-                }
+                self.invalidate_scan_pages(doc);
                 let msg = summary(&report);
                 self.notify(msg);
+                scan_clean_result::landed(self, run, report.halftone);
             }
-            Err(EditError::Cancelled) => self.notify_tr("Enhancing the scanned pages was cancelled"),
-            Err(e) => self.notify(e.to_string()),
+            Err(e) => {
+                match e {
+                    EditError::Cancelled => self.notify_tr("Enhancing the scanned pages was cancelled"),
+                    e => self.notify(e.to_string()),
+                }
+                if let Some(again) = run.ask.again {
+                    scan_clean_result::not_done(self, doc, again);
+                }
+            }
         }
     }
 }

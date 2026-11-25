@@ -257,6 +257,36 @@ impl Session {
         Ok(cleaned.report)
     }
 
+    /// [`Self::scan_clean_job`] for doing the last step of document `id`, a clean-up of these `pages`, again from the
+    /// scans as they were before it. The document keeps that step: [`Self::replace_scan_clean`] swaps the result in.
+    pub fn scan_clean_again_job(&self, id: DocId, pages: &[usize], settings: ScanCleanSettings) -> Result<ScanCleanJob, EditError> {
+        // A clean-up keeps each picture's object, size and place, so the scans found now are those found before it.
+        let mut job = self.scan_clean_job(id, pages, settings)?;
+        let editor = self.get(id).and_then(|d| d.editor.as_ref()).ok_or(EditError::NoDocument)?;
+        job.cos = editor.undo.last().ok_or(EditError::NothingToUndo)?.1.clone();
+        Ok(job)
+    }
+
+    /// Put the result of a [`Self::scan_clean_again_job`] in the place of the clean-up it repeats, as the same one
+    /// undoable step. On an error, such as the document having changed since the job was taken, that clean-up stays.
+    pub fn replace_scan_clean(&mut self, id: DocId, cleaned: ScanCleaned) -> Result<ScanCleanReport, EditError> {
+        let replaces = !cleaned.images.is_empty();
+        let undo = self.get(id).and_then(|d| d.editor.as_ref()).map(|e| &e.undo);
+        let (depth, oldest) = (undo.map_or(0, Vec::len), undo.and_then(|u| u.first().cloned()));
+        let report = self.apply_scan_clean(id, cleaned)?;
+        // The step back from the new one goes to the document before the first, not to the first.
+        if replaces && let Some(editor) = self.doc_mut(id)?.editor.as_mut() {
+            editor.undo.pop();
+            // A full history dropped its oldest step for the one just taken away.
+            if editor.undo.len() < depth
+                && let Some(oldest) = oldest
+            {
+                editor.undo.insert(0, oldest);
+            }
+        }
+        Ok(report)
+    }
+
     /// Enhance ▸ Scanned document in one call: [`Self::scan_clean_job`], run, then
     /// [`Self::apply_scan_clean`] (the CLI and agents use this).
     pub fn enhance_scanned_pages(&mut self, id: DocId, pages: &[usize], settings: ScanCleanSettings) -> Result<ScanCleanReport, EditError> {
